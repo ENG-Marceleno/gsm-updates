@@ -2760,6 +2760,7 @@ function teardownChat(){
   viewTabChat.style.display = 'none';
   fabEl.classList.remove('hide');
   setFabOpen(false);
+  releaseMic();
 }
 
 function renderChatList(){
@@ -3009,6 +3010,28 @@ const MAX_AUDIO_DATAURL = 900000;
 let chatPendingImage = null;           // base64 of the image waiting to be sent
 let recorder = null, recStream = null, recChunks = [], recTimer = null, recStart = 0, recCancelled = false;
 
+/* ---- ONE-TIME MIC: ask the browser once, then reuse the same stream for voice notes AND calls ----
+   The stream stays open (tracks are only switched off while idle), so the browser has no reason
+   to show the permission prompt again. It is released on logout. */
+const MIC_CONSTRAINTS = { audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true } };
+let sharedMic = null, micPending = null;
+function micIsLive(){ return !!sharedMic && sharedMic.getAudioTracks().some(t => t.readyState === 'live'); }
+async function getSharedMic(){
+  if(micIsLive()) return sharedMic;
+  if(micPending) return micPending;
+  micPending = navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS).then(st => {
+    sharedMic = st;
+    st.getAudioTracks().forEach(t => {
+      t.enabled = false;
+      t.addEventListener('ended', () => { if(sharedMic === st) sharedMic = null; });
+    });
+    return st;
+  }).finally(() => { micPending = null; });
+  return micPending;
+}
+function micOn(on){ if(sharedMic) sharedMic.getAudioTracks().forEach(t => { t.enabled = !!on; }); }
+function releaseMic(){ if(sharedMic){ sharedMic.getTracks().forEach(t => t.stop()); sharedMic = null; } }
+
 function resetChatImage(){
   chatImageInput.value = '';
   chatPendingImage = null;
@@ -3049,7 +3072,7 @@ function blobToDataUrl(blob){
 }
 function endRecordingUI(){
   clearInterval(recTimer); recTimer = null;
-  if(recStream){ recStream.getTracks().forEach(t => t.stop()); recStream = null; }
+  if(recStream){ micOn(false); recStream = null; }   // keep the permission, just switch the mic off
   chatRecBar.classList.remove('show');
   chatRow.style.display = 'flex';
   chatMicBtn.disabled = false;
@@ -3062,7 +3085,8 @@ async function startRecording(){
     return;
   }
   try{
-    recStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    recStream = await getSharedMic();
+    micOn(true);
   } catch(err){
     console.error('getUserMedia error:', err);
     showToast(GSM_ENV.micError(err));
@@ -3274,6 +3298,7 @@ const callMuteBtn = $('call-mute'), callEndBtn = $('call-end'), callAudio = $('c
 const callBtn = $('call-btn'), callIncoming = $('call-incoming');
 const viewCalls = $('view-calls'), viewTabCalls = $('view-tab-calls'), callsPill = $('calls-pill');
 let callPC = null, callStream = null, activeCallId = null, callRole = null, callAnsweredAt = 0;
+let callBusy = false;
 let callUnsubs = [], callTick = null, ringTimer = null, callMuted = false;
 let callsUnsub = null, callsList = [], callsTick = null, ringKey = '', ringCtx = null, ringInt = null;
 const ms = ts => toDate(ts).getTime();
@@ -3293,7 +3318,7 @@ function stopRing(){ clearInterval(ringInt); ringInt = null; }
 
 async function openMic(){
   if(!navigator.mediaDevices || !window.RTCPeerConnection){ showToast(GSM_ENV.problem() || 'Calls are not supported in this browser'); return null; }
-  try{ return await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true } }); }
+  try{ const st = await getSharedMic(); micOn(true); return st; }
   catch(e){ console.error('getUserMedia error:', e); showToast(GSM_ENV.micError(e)); return null; }
 }
 function makePC(callId, mine, theirs, ice){
@@ -3318,11 +3343,13 @@ function makePC(callId, mine, theirs, ice){
   pc.onconnectionstatechange = () => {
     console.log('[call] connection state:', pc.connectionState);
     if(pc.connectionState === 'connected'){
-      clearTimeout(pc._watch);
+      clearTimeout(pc._watch); clearTimeout(pc._dc);
       if(callRole === 'agent') callBarName.textContent = 'Connected';
       unlockAudio();
     } else if(pc.connectionState === 'disconnected'){
       showToast('Connection unstable…');
+      clearTimeout(pc._dc);
+      pc._dc = setTimeout(() => { if(callPC === pc && pc.connectionState === 'disconnected') hangUp(); }, 10000);
     } else if(pc.connectionState === 'failed'){
       showToast('Call connection failed - check your network'); hangUp();
     }
@@ -3349,8 +3376,8 @@ function beginTimer(start){
 function cleanupCall(){
   clearTimeout(ringTimer); clearInterval(callTick); callTick = null;
   callUnsubs.splice(0).forEach(u => u());
-  if(callPC){ clearTimeout(callPC._watch); callPC.close(); callPC = null; }
-  if(callStream){ callStream.getTracks().forEach(t => t.stop()); callStream = null; }
+  if(callPC){ clearTimeout(callPC._watch); clearTimeout(callPC._dc); callPC.close(); callPC = null; }
+  if(callStream){ micOn(false); callStream = null; }   // keep the permission, just switch the mic off
   callAudio.srcObject = null;
   activeCallId = null; callRole = null; callAnsweredAt = 0; callMuted = false;
   callBar.classList.remove('show'); callMuteBtn.classList.remove('on'); callMuteBtn.textContent = '🎙️';
@@ -3367,8 +3394,19 @@ async function hangUp(){
 }
 
 /* ---- Agent: start a call ---- */
+/* a leftover call state (e.g. the other side closed the page) must never block a new call */
+function callIsStale(){
+  return !!activeCallId && (!callPC || callPC.signalingState === 'closed' || ['closed','failed'].includes(callPC.connectionState));
+}
 async function startCall(){
-  if(isAdmin || activeCallId) return;
+  if(callBusy) return;
+  callBusy = true;
+  try{ await startCallInner(); } finally { callBusy = false; }
+}
+async function startCallInner(){
+  if(isAdmin) return;
+  if(callIsStale()) cleanupCall();
+  if(activeCallId) return;
   callStream = await openMic(); if(!callStream) return;
   const ice = await getIceConfig();
   if(!ice.hasTurn) showToast('TURN server not configured - calls may fail on mobile networks');
@@ -3405,8 +3443,14 @@ async function startCall(){
 
 /* ---- Leader: answer / end / delete ---- */
 async function answerCall(c){
+  if(callBusy) return;                      // ignore double taps while a call is being set up
+  callBusy = true;
+  try{ await answerCallInner(c); } finally { callBusy = false; }
+}
+async function answerCallInner(c){
   if(!isAdmin) return;
-  if(activeCallId){ showToast('End your current call first'); return; }
+  if(callIsStale()) cleanupCall();          // silently clear a leftover call state
+  if(activeCallId){ showToast('You are already in a call. End it first.'); return; }
   if(!isRinging(c)){ showToast('This call is no longer ringing'); return; }
   callStream = await openMic(); if(!callStream) return;
   const ice = await getIceConfig();
